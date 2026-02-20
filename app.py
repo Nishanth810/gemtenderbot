@@ -5,8 +5,11 @@
 #  ✅ Organization fallback from target (not from API)
 #  ✅ Links work perfectly
 #  ✅ Excel shows correct org names
-#  ✅ Email to multiple receivers
+#  ✅ Email to multiple receivers (STARTTLS + SSL fallback)
 #  ✅ Windows sleep prevention
+#  ✅ Duplicates shown in RED on separate sheet
+#  ✅ Rich HTML email format
+#  ✅ RA NO bids (Rate Agreement) filtered out completely
 #
 #  INSTALL:  pip install requests pandas openpyxl python-dotenv
 #  RUN:      python gem_scraper_ULTIMATE.py
@@ -18,6 +21,10 @@ from datetime import datetime
 from pathlib import Path
 from logging.handlers import RotatingFileHandler
 from email.message import EmailMessage
+from email.mime.multipart import MIMEMultipart
+from email.mime.text import MIMEText
+from email.mime.base import MIMEBase
+from email import encoders
 from typing import Dict, List, Tuple
 
 import pandas as pd
@@ -48,9 +55,11 @@ COLOR_NEW      = PatternFill("solid", fgColor="C6EFCE")
 COLOR_CHANGED  = PatternFill("solid", fgColor="FFEB9C")
 COLOR_EXISTING = PatternFill("solid", fgColor="EBF3FB")
 COLOR_ALT      = PatternFill("solid", fgColor="D9E1F2")
+COLOR_DUPE     = PatternFill("solid", fgColor="FF9999")   # RED for duplicates
 FONT_HEADER    = Font(name="Arial", bold=True, color="FFFFFF", size=11)
 FONT_LINK      = Font(name="Arial", color="0563C1", underline="single", size=10)
 FONT_DATA      = Font(name="Arial", size=10)
+FONT_DUPE      = Font(name="Arial", size=10, color="CC0000", bold=True)
 THIN           = Border(
     left=Side(style="thin", color="BFBFBF"),
     right=Side(style="thin", color="BFBFBF"),
@@ -59,7 +68,7 @@ THIN           = Border(
 )
 
 # =============================================================================
-#  TARGETS — ONLY WORKING ORGS (removed failing OFFICE OF DG entries)
+#  TARGETS
 # =============================================================================
 TARGETS = [
     {"ministry": "Department of Space", "organization": "indian space research organization"},
@@ -111,7 +120,7 @@ TARGETS = [
     {"ministry": "PMO", "organization": "Semi Conductor Laboratory"},
     {"ministry": "PMO", "organization": "TATA INSTITUTE OF FUNDAMENTAL RESEARCH HYDERABAD"},
     {"ministry": "PMO", "organization": "Tata Institute of Fundamental Research MUMBAI"},
-    {"ministry": "PMO", "organization": "Tata Memorial Center – Advanced Center for Treatment, Research and Education in Cancer (ACTREC)"},
+    {"ministry": "PMO", "organization": "Tata Memorial Center \u2013 Advanced Center for Treatment, Research and Education in Cancer (ACTREC)"},
     {"ministry": "PMO", "organization": "Tata Memorial Centre"},
     {"ministry": "PMO", "organization": "Tata Memorial Centre  HBCH RC VIZAG"},
     {"ministry": "PMO", "organization": "TATA MEMORIAL CENTRE MPMMCC AND HBCH VARANASI Madh"},
@@ -119,9 +128,6 @@ TARGETS = [
     {"ministry": "PMO", "organization": "TIFR CENTRE FOR APPLICABLE MATHEMATICS"},
     {"ministry": "PMO", "organization": "URANIUM CORPORATION OF INDIA LIMITED"},
     {"ministry": "PMO", "organization": "VARIABLE ENERGY CYCLOTRON CENTRE"},
-    
-    
-    
 ]
 
 # =============================================================================
@@ -147,10 +153,21 @@ def setup_logger() -> logging.Logger:
 
 LOG = setup_logger()
 
-load_dotenv()
+# Always load .env from the app directory and override any stale session vars.
+load_dotenv(dotenv_path=Path(__file__).resolve().parent / ".env", override=True)
 SENDER_EMAIL    = os.getenv("SENDER_EMAIL", "")
 APP_PASSWORD    = os.getenv("APP_PASSWORD", "")
 RECEIVER_EMAILS = [e.strip() for e in os.getenv("RECEIVER_EMAILS", "").split(",") if e.strip()]
+
+# =============================================================================
+#  RA NO FILTER — Rate Agreement bids are skipped entirely
+#  GeM bid numbers for RA look like: GEM/2026/R/626722  (contains /R/)
+#  Regular bids look like:           GEM/2026/B/7175886 (contains /B/)
+# =============================================================================
+def _is_ra_bid(bid_number: str) -> bool:
+    """Return True if this is a Rate Agreement bid — should be excluded."""
+    # Pattern: GEM/YYYY/R/NNNNNN  — the segment after year is 'R'
+    return bool(re.search(r'/R/', bid_number, re.IGNORECASE))
 
 # =============================================================================
 #  SESSION
@@ -332,7 +349,7 @@ def fetch_all_bids(session: requests.Session, target: Dict) -> Tuple[List[Dict],
 
         time.sleep(DELAY_PAGE)
 
-    LOG.info(f"  ✓ Total: {len(all_docs)}")
+    LOG.info(f"  ✓ Total raw: {len(all_docs)}")
     return all_docs, session
 
 # =============================================================================
@@ -377,32 +394,31 @@ def get_free_path(path: str) -> str:
         return f"{base}_{ts}{ext}"
 
 # =============================================================================
-#  PARSE DOCS — FRIEND'S EXACT METHOD
+#  PARSE DOCS — Filters out RA bids before they enter any downstream logic
 # =============================================================================
 EXCEL_COLS = ["Status", "Bid Number", "Bid URL", "Category", "Quantity",
               "Ministry", "Organization", "Start Date", "End Date"]
 
 def parse_docs(docs: List[Dict], ministry: str, organization: str) -> List[Dict]:
-    """
-    ✅ CRITICAL: Use FRIEND'S working approach:
-    1. URL uses showbidDocument/<numeric_id> from doc['id']
-    2. Organization fallback to target org (not API field)
-    """
     bids = []
+    ra_skipped = 0
+
     for doc in docs:
         bid_number = _safe(doc, "b_bid_number")
         if not bid_number:
             continue
 
-        # ✅ FIX 1: Use friend's URL pattern - showbidDocument with numeric ID
-        doc_id = _safe(doc, "id")  # Numeric ID from Solr
+        # ✅ Skip Rate Agreement (RA) bids — pattern GEM/YYYY/R/NNNNNN
+        if _is_ra_bid(bid_number):
+            ra_skipped += 1
+            continue
+
+        doc_id = _safe(doc, "id")
         if doc_id and doc_id.isdigit():
             bid_url = f"{BASE_URL}/showbidDocument/{doc_id}"
         else:
-            # Fallback if no ID found
             bid_url = f"{BASE_URL}/biddetail/{bid_number.replace('/', '%2F')}"
 
-        # ✅ FIX 2: Organization fallback to target org
         bids.append({
             "Bid Number":   bid_number,
             "Bid URL":      bid_url,
@@ -413,6 +429,10 @@ def parse_docs(docs: List[Dict], ministry: str, organization: str) -> List[Dict]
             "Start Date":   _fmt_date(_safe(doc, "final_start_date_sort")),
             "End Date":     _fmt_date(_safe(doc, "final_end_date_sort")),
         })
+
+    if ra_skipped:
+        LOG.info(f"  ⛔ RA bids filtered out: {ra_skipped}")
+
     return bids
 
 # =============================================================================
@@ -470,13 +490,13 @@ def update_history(bids: List[Dict], org_key: str, history: Dict):
 # =============================================================================
 def _style_sheet(ws, col_index: Dict):
     url_col = col_index.get("Bid URL")
-    bn_col = col_index.get("Bid Number")
+    bn_col  = col_index.get("Bid Number")
 
     for cell in ws[1]:
-        cell.fill = COLOR_HEADER
-        cell.font = FONT_HEADER
+        cell.fill      = COLOR_HEADER
+        cell.font      = FONT_HEADER
         cell.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
-        cell.border = THIN
+        cell.border    = THIN
     ws.row_dimensions[1].height = 28
 
     for row_idx in range(2, ws.max_row + 1):
@@ -492,18 +512,18 @@ def _style_sheet(ws, col_index: Dict):
             fill = COLOR_EXISTING
 
         for col in range(1, ws.max_column + 1):
-            cell = ws.cell(row_idx, col)
-            cell.fill = fill
-            cell.font = FONT_DATA
-            cell.border = THIN
+            cell           = ws.cell(row_idx, col)
+            cell.fill      = fill
+            cell.font      = FONT_DATA
+            cell.border    = THIN
             cell.alignment = Alignment(vertical="center", wrap_text=False)
 
         if bn_col and url_col:
             url = ws.cell(row_idx, url_col).value or ""
             if str(url).startswith("http"):
-                bn_c = ws.cell(row_idx, bn_col)
+                bn_c           = ws.cell(row_idx, bn_col)
                 bn_c.hyperlink = str(url)
-                bn_c.font = FONT_LINK
+                bn_c.font      = FONT_LINK
 
     if url_col:
         ws.column_dimensions[get_column_letter(url_col)].hidden = True
@@ -518,8 +538,54 @@ def _style_sheet(ws, col_index: Dict):
         )
         ws.column_dimensions[letter].width = min(max_len + 3, 55)
 
-    ws.freeze_panes = "A2"
+    ws.freeze_panes       = "A2"
+    ws.auto_filter.ref    = ws.dimensions
+
+
+def _style_duplicates_sheet(ws, col_index: Dict):
+    url_col = col_index.get("Bid URL")
+    bn_col  = col_index.get("Bid Number")
+
+    for cell in ws[1]:
+        cell.fill      = PatternFill("solid", fgColor="8B0000")
+        cell.font      = Font(name="Arial", bold=True, color="FFFFFF", size=11)
+        cell.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
+        cell.border    = THIN
+    ws.row_dimensions[1].height = 28
+
+    for row_idx in range(2, ws.max_row + 1):
+        fill = COLOR_DUPE if row_idx % 2 == 0 else PatternFill("solid", fgColor="FFCCCC")
+
+        for col in range(1, ws.max_column + 1):
+            cell           = ws.cell(row_idx, col)
+            cell.fill      = fill
+            cell.font      = FONT_DUPE
+            cell.border    = THIN
+            cell.alignment = Alignment(vertical="center", wrap_text=False)
+
+        if bn_col and url_col:
+            url = ws.cell(row_idx, url_col).value or ""
+            if str(url).startswith("http"):
+                bn_c           = ws.cell(row_idx, bn_col)
+                bn_c.hyperlink = str(url)
+                bn_c.font      = Font(name="Arial", color="8B0000", underline="single", size=10, bold=True)
+
+    if url_col:
+        ws.column_dimensions[get_column_letter(url_col)].hidden = True
+
+    for col in range(1, ws.max_column + 1):
+        letter = get_column_letter(col)
+        if ws.column_dimensions[letter].hidden:
+            continue
+        max_len = max(
+            (len(str(ws.cell(r, col).value or "")) for r in range(1, min(ws.max_row + 1, 200))),
+            default=10,
+        )
+        ws.column_dimensions[letter].width = min(max_len + 3, 55)
+
+    ws.freeze_panes    = "A2"
     ws.auto_filter.ref = ws.dimensions
+
 
 def _style_summary_sheet(ws):
     for cell in ws[1]:
@@ -527,6 +593,7 @@ def _style_summary_sheet(ws):
         cell.font = FONT_HEADER
     ws.column_dimensions["A"].width = 30
     ws.column_dimensions["B"].width = 20
+
 
 def _style_byorg_sheet(ws):
     for cell in ws[1]:
@@ -536,10 +603,11 @@ def _style_byorg_sheet(ws):
     ws.column_dimensions["B"].width = 35
     ws.column_dimensions["C"].width = 12
 
+
 # =============================================================================
 #  EXCEL BUILDER
 # =============================================================================
-def build_master_excel(all_rows: List[Tuple], file_path: str) -> str:
+def build_master_excel(all_rows: List[Tuple], all_duplicates: List[Dict], file_path: str) -> str:
     file_path = get_free_path(file_path)
     os.makedirs(os.path.dirname(file_path) if os.path.dirname(file_path) else ".", exist_ok=True)
 
@@ -560,6 +628,22 @@ def build_master_excel(all_rows: List[Tuple], file_path: str) -> str:
 
     df = pd.DataFrame(rows, columns=EXCEL_COLS)
 
+    dup_rows = [
+        [
+            "DUPLICATE",
+            d.get("Bid Number", ""),
+            d.get("Bid URL", ""),
+            d.get("Category", ""),
+            d.get("Quantity", ""),
+            d.get("Ministry", ""),
+            d.get("Organization", ""),
+            d.get("Start Date", ""),
+            d.get("End Date", ""),
+        ]
+        for d in all_duplicates
+    ]
+    df_dupes = pd.DataFrame(dup_rows, columns=EXCEL_COLS) if dup_rows else pd.DataFrame(columns=EXCEL_COLS)
+
     seen_ministries, seen_orgs = [], []
     for _, bid in all_rows:
         m = bid.get("Ministry", "").strip()
@@ -569,7 +653,7 @@ def build_master_excel(all_rows: List[Tuple], file_path: str) -> str:
         if o and o not in seen_orgs:
             seen_orgs.append(o)
 
-    LOG.info(f"  Ministries: {len(seen_ministries)} | Orgs: {len(seen_orgs)}")
+    LOG.info(f"  Ministries: {len(seen_ministries)} | Orgs: {len(seen_orgs)} | Duplicates: {len(all_duplicates)}")
 
     with pd.ExcelWriter(file_path, engine="openpyxl") as writer:
         df.to_excel(writer, sheet_name="All_Bids", index=False)
@@ -595,20 +679,29 @@ def build_master_excel(all_rows: List[Tuple], file_path: str) -> str:
                 subset.to_excel(writer, sheet_name=sn, index=False)
 
         pd.DataFrame({
-            "Metric": ["Generated", "Total", "NEW", "CHANGED", "EXISTING", "Ministries", "Orgs"],
+            "Metric": ["Generated", "Total", "NEW", "CHANGED", "EXISTING", "DUPLICATES", "Ministries", "Orgs"],
             "Value": [
                 datetime.now().strftime("%d-%m-%Y %H:%M"),
                 len(df),
                 len(df[df["Status"] == "NEW"]),
                 len(df[df["Status"] == "DATE CHANGED"]),
                 len(df[df["Status"] == "EXISTING"]),
+                len(df_dupes),
                 len(seen_ministries),
                 len(seen_orgs),
             ],
         }).to_excel(writer, sheet_name="Summary", index=False)
 
-        org_counts = df.groupby(["Ministry", "Organization"]).size().reset_index(name="Count").sort_values(["Ministry", "Count"], ascending=[True, False])
+        org_counts = (
+            df.groupby(["Ministry", "Organization"])
+            .size()
+            .reset_index(name="Count")
+            .sort_values(["Ministry", "Count"], ascending=[True, False])
+        )
         org_counts.to_excel(writer, sheet_name="By_Org", index=False)
+
+        if not df_dupes.empty:
+            df_dupes.to_excel(writer, sheet_name="Duplicates", index=False)
 
     wb = load_workbook(file_path)
     for sn in wb.sheetnames:
@@ -617,6 +710,9 @@ def build_master_excel(all_rows: List[Tuple], file_path: str) -> str:
             _style_summary_sheet(ws)
         elif sn == "By_Org":
             _style_byorg_sheet(ws)
+        elif "Duplicates" in sn:
+            col_index = {ws.cell(1, c).value: c for c in range(1, ws.max_column + 1)}
+            _style_duplicates_sheet(ws, col_index)
         else:
             col_index = {ws.cell(1, c).value: c for c in range(1, ws.max_column + 1)}
             _style_sheet(ws, col_index)
@@ -625,56 +721,258 @@ def build_master_excel(all_rows: List[Tuple], file_path: str) -> str:
     LOG.info(f"  ✅ Excel: {file_path}")
     return file_path
 
+
 # =============================================================================
-#  EMAIL
+#  EMAIL — RICH HTML FORMAT  (STARTTLS port 587 + SSL port 465 fallback)
 # =============================================================================
-def send_summary_email(results: List[Dict], all_rows: List[Tuple], all_changes: List[Dict], excel_path: str):
+def send_summary_email(results: List[Dict], all_rows: List[Tuple], all_changes: List[Dict],
+                       all_duplicates: List[Dict], excel_path: str):
     if not (SENDER_EMAIL and APP_PASSWORD and RECEIVER_EMAILS):
-        LOG.info("  Email skipped")
+        LOG.info("  Email skipped — credentials missing in .env")
         return
 
     total = len(all_rows)
     new_c = sum(1 for s, _ in all_rows if s == "NEW")
     chg_c = sum(1 for s, _ in all_rows if s == "DATE CHANGED")
+    ex_c  = sum(1 for s, _ in all_rows if s == "EXISTING")
+    dup_c = len(all_duplicates)
+
+    run_time = datetime.now().strftime("%d-%m-%Y %I:%M %p")
+
+    ministry_stats: Dict[str, Dict] = {}
+    for r in results:
+        min_name = r["label"].split(" / ")[0].strip()
+        if min_name not in ministry_stats:
+            ministry_stats[min_name] = {"total": 0, "new": 0, "changed": 0, "existing": 0}
+        ministry_stats[min_name]["total"]    += r["total"]
+        ministry_stats[min_name]["new"]      += r["new"]
+        ministry_stats[min_name]["changed"]  += r["changed"]
+        ministry_stats[min_name]["existing"] += r["existing"]
 
     parts = []
-    if new_c: parts.append(f"{new_c} NEW")
-    if chg_c: parts.append(f"{chg_c} CHANGED")
-    subject = "GeM Bids — " + " | ".join(parts) if parts else "GeM Bids — No Changes"
+    if new_c:  parts.append(f"{new_c} NEW")
+    if chg_c:  parts.append(f"{chg_c} CHANGED")
+    if dup_c:  parts.append(f"{dup_c} DUPLICATES")
+    subject = "🔔 GeM Bids — " + " | ".join(parts) if parts else "✅ GeM Bids — No Changes"
 
-    body = (
-        f"GeM BidPlus Report\n"
-        f"Run: {datetime.now().strftime('%d-%m-%Y %I:%M %p')}\n\n"
-        f"NEW: {new_c} | CHANGED: {chg_c} | TOTAL: {total}\n\n"
-        f"Excel: {os.path.basename(excel_path)}\n"
+    ministry_rows_html = ""
+    for min_name, stats in ministry_stats.items():
+        ministry_rows_html += f"""
+        <tr>
+          <td style="padding:8px 12px; border-bottom:1px solid #e0e0e0; font-weight:600; color:#1F4E79;">{min_name}</td>
+          <td style="padding:8px 12px; border-bottom:1px solid #e0e0e0; text-align:center;">{stats['total']}</td>
+          <td style="padding:8px 12px; border-bottom:1px solid #e0e0e0; text-align:center; color:#2e7d32; font-weight:bold;">{stats['new']}</td>
+          <td style="padding:8px 12px; border-bottom:1px solid #e0e0e0; text-align:center; color:#f57f17; font-weight:bold;">{stats['changed']}</td>
+          <td style="padding:8px 12px; border-bottom:1px solid #e0e0e0; text-align:center; color:#555;">{stats['existing']}</td>
+        </tr>"""
+
+    changed_section = ""
+    if all_changes:
+        changed_rows = ""
+        for c in all_changes[:20]:
+            changed_rows += f"""
+            <tr>
+              <td style="padding:6px 10px; border-bottom:1px solid #ffe082; font-size:13px;">{c.get('bid_number','')}</td>
+              <td style="padding:6px 10px; border-bottom:1px solid #ffe082; font-size:13px;">{c.get('description','')[:60]}</td>
+              <td style="padding:6px 10px; border-bottom:1px solid #ffe082; font-size:13px; color:#c62828;">{c.get('old_date','')}</td>
+              <td style="padding:6px 10px; border-bottom:1px solid #ffe082; font-size:13px; color:#2e7d32; font-weight:bold;">{c.get('new_date','')}</td>
+            </tr>"""
+        more_note = (
+            f"<p style='font-size:12px;color:#777;'>... and {len(all_changes)-20} more. See Excel for full list.</p>"
+            if len(all_changes) > 20 else ""
+        )
+        changed_section = f"""
+        <div style="margin:24px 0;">
+          <h3 style="color:#f57f17; margin-bottom:10px;">⚠️ Date Changed Tenders ({len(all_changes)})</h3>
+          <table style="width:100%; border-collapse:collapse; background:#fffde7; border-radius:6px; overflow:hidden;">
+            <thead>
+              <tr style="background:#f9a825;">
+                <th style="padding:8px 10px; text-align:left; font-size:13px;">Bid Number</th>
+                <th style="padding:8px 10px; text-align:left; font-size:13px;">Description</th>
+                <th style="padding:8px 10px; text-align:left; font-size:13px;">Old Date</th>
+                <th style="padding:8px 10px; text-align:left; font-size:13px;">New Date</th>
+              </tr>
+            </thead>
+            <tbody>{changed_rows}</tbody>
+          </table>
+          {more_note}
+        </div>"""
+
+    dup_section = ""
+    if dup_c:
+        dup_section = f"""
+        <div style="margin:24px 0; padding:14px 18px; background:#ffebee; border-left:5px solid #c62828; border-radius:4px;">
+          <strong style="color:#c62828;">&#x26D4; {dup_c} Duplicate Bid(s) Found</strong>
+          <p style="margin:6px 0 0; font-size:13px; color:#555;">
+            These bids appeared more than once across different org queries.
+            They are listed in the <span style="color:#c62828; font-weight:bold;">Duplicates</span>
+            sheet (highlighted in RED) in the attached Excel.
+          </p>
+        </div>"""
+
+    html_body = f"""
+<!DOCTYPE html>
+<html>
+<head><meta charset="UTF-8"></head>
+<body style="margin:0; padding:0; background:#f4f6f9; font-family:Arial,sans-serif;">
+  <div style="max-width:720px; margin:30px auto; background:#ffffff; border-radius:10px;
+              box-shadow:0 2px 12px rgba(0,0,0,0.1); overflow:hidden;">
+
+    <div style="background:linear-gradient(135deg,#1F4E79,#2e86c1); padding:28px 32px;">
+      <h1 style="margin:0; color:#ffffff; font-size:22px; letter-spacing:0.5px;">
+        &#x1F4CB; GeM BidPlus Tender Report
+      </h1>
+      <p style="margin:6px 0 0; color:#b3d4f0; font-size:14px;">Generated: {run_time}</p>
+    </div>
+
+    <div style="padding:24px 32px 0;">
+      <h2 style="color:#1F4E79; margin-bottom:16px; font-size:16px; border-bottom:2px solid #e3eaf3; padding-bottom:8px;">
+        Overall Summary
+      </h2>
+      <div style="display:flex; gap:12px; flex-wrap:wrap;">
+        <div style="flex:1; min-width:110px; background:#e8f5e9; border-radius:8px; padding:16px; text-align:center;">
+          <div style="font-size:28px; font-weight:bold; color:#2e7d32;">{new_c}</div>
+          <div style="font-size:13px; color:#555; margin-top:4px;">NEW</div>
+        </div>
+        <div style="flex:1; min-width:110px; background:#fffde7; border-radius:8px; padding:16px; text-align:center;">
+          <div style="font-size:28px; font-weight:bold; color:#f57f17;">{chg_c}</div>
+          <div style="font-size:13px; color:#555; margin-top:4px;">DATE CHANGED</div>
+        </div>
+        <div style="flex:1; min-width:110px; background:#e3f2fd; border-radius:8px; padding:16px; text-align:center;">
+          <div style="font-size:28px; font-weight:bold; color:#1565c0;">{ex_c}</div>
+          <div style="font-size:13px; color:#555; margin-top:4px;">EXISTING</div>
+        </div>
+        <div style="flex:1; min-width:110px; background:#ffebee; border-radius:8px; padding:16px; text-align:center;">
+          <div style="font-size:28px; font-weight:bold; color:#c62828;">{dup_c}</div>
+          <div style="font-size:13px; color:#555; margin-top:4px;">DUPLICATES</div>
+        </div>
+        <div style="flex:1; min-width:110px; background:#f3e5f5; border-radius:8px; padding:16px; text-align:center;">
+          <div style="font-size:28px; font-weight:bold; color:#6a1b9a;">{total}</div>
+          <div style="font-size:13px; color:#555; margin-top:4px;">TOTAL</div>
+        </div>
+      </div>
+    </div>
+
+    <div style="padding:24px 32px 0;">
+      <h2 style="color:#1F4E79; margin-bottom:12px; font-size:16px; border-bottom:2px solid #e3eaf3; padding-bottom:8px;">
+        Ministry-wise Breakdown
+      </h2>
+      <table style="width:100%; border-collapse:collapse; font-size:14px;">
+        <thead>
+          <tr style="background:#1F4E79; color:#fff;">
+            <th style="padding:10px 12px; text-align:left;">Ministry</th>
+            <th style="padding:10px 12px; text-align:center;">Total</th>
+            <th style="padding:10px 12px; text-align:center;">New</th>
+            <th style="padding:10px 12px; text-align:center;">Changed</th>
+            <th style="padding:10px 12px; text-align:center;">Existing</th>
+          </tr>
+        </thead>
+        <tbody>{ministry_rows_html}</tbody>
+        <tfoot>
+          <tr style="background:#e3eaf3; font-weight:bold;">
+            <td style="padding:10px 12px;">TOTAL</td>
+            <td style="padding:10px 12px; text-align:center;">{total}</td>
+            <td style="padding:10px 12px; text-align:center; color:#2e7d32;">{new_c}</td>
+            <td style="padding:10px 12px; text-align:center; color:#f57f17;">{chg_c}</td>
+            <td style="padding:10px 12px; text-align:center;">{ex_c}</td>
+          </tr>
+        </tfoot>
+      </table>
+    </div>
+
+    <div style="padding:0 32px;">{changed_section}</div>
+    <div style="padding:0 32px;">{dup_section}</div>
+
+    <div style="padding:20px 32px;">
+      <div style="background:#e8f5e9; border-left:5px solid #2e7d32; padding:14px 18px; border-radius:4px;">
+        <strong style="color:#2e7d32;">Excel Attached:</strong>
+        <span style="font-size:13px; color:#333; margin-left:8px;">{os.path.basename(excel_path)}</span>
+        <p style="margin:6px 0 0; font-size:12px; color:#666;">
+          Contains: All Bids &middot; Ministry tabs &middot; Org tabs &middot; Summary &middot; By_Org
+          {"&middot; Duplicates (RED)" if dup_c else ""}
+        </p>
+      </div>
+    </div>
+
+    <div style="background:#f4f6f9; padding:16px 32px; text-align:center; border-top:1px solid #e0e0e0;">
+      <p style="margin:0; font-size:12px; color:#999;">
+        GeM BidPlus Automated Bot &nbsp;|&nbsp; {run_time} &nbsp;|&nbsp; RA bids excluded
+      </p>
+    </div>
+  </div>
+</body>
+</html>"""
+
+    plain_body = (
+        f"GeM BidPlus Report | {run_time}\n\n"
+        f"NEW: {new_c} | CHANGED: {chg_c} | EXISTING: {ex_c} | DUPLICATES: {dup_c} | TOTAL: {total}\n\n"
+        + "\n".join(f"  {m}: T={s['total']} N={s['new']} C={s['changed']}" for m, s in ministry_stats.items())
+        + f"\n\nNote: Rate Agreement (RA) bids excluded.\nExcel attached: {os.path.basename(excel_path)}"
     )
 
-    msg = EmailMessage()
-    msg["From"] = SENDER_EMAIL
-    msg["To"] = ", ".join(RECEIVER_EMAILS)
-    msg["Subject"] = subject
-    msg.set_content(body)
+    # ── Build MIME (mixed so Excel attachment works alongside html/plain) ──
+    msg_outer = MIMEMultipart("mixed")
+    msg_outer["From"]    = SENDER_EMAIL
+    msg_outer["To"]      = ", ".join(RECEIVER_EMAILS)
+    msg_outer["Subject"] = subject
+
+    msg_alt = MIMEMultipart("alternative")
+    msg_alt.attach(MIMEText(plain_body, "plain", "utf-8"))
+    msg_alt.attach(MIMEText(html_body,  "html",  "utf-8"))
+    msg_outer.attach(msg_alt)
 
     if os.path.exists(excel_path):
         with open(excel_path, "rb") as f:
-            msg.add_attachment(f.read(), maintype="application",
-                             subtype="vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                             filename=os.path.basename(excel_path))
+            part = MIMEBase("application", "vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+            part.set_payload(f.read())
+            encoders.encode_base64(part)
+            part.add_header("Content-Disposition", "attachment",
+                            filename=os.path.basename(excel_path))
+            msg_outer.attach(part)
 
-    try:
-        with smtplib.SMTP_SSL("smtp.gmail.com", 465, timeout=30) as smtp:
+    # ── Send: STARTTLS/587 first, SSL/465 fallback ──────────────────────────
+    sent = False
+    for method, host, port in [("STARTTLS", "smtp.gmail.com", 587),
+                                ("SSL",      "smtp.gmail.com", 465)]:
+        try:
+            LOG.info(f"  Trying {method} port {port}...")
+            if method == "STARTTLS":
+                smtp = smtplib.SMTP(host, port, timeout=60)
+                smtp.ehlo()
+                smtp.starttls()
+                smtp.ehlo()
+            else:
+                smtp = smtplib.SMTP_SSL(host, port, timeout=60)
+                smtp.ehlo()
+
             smtp.login(SENDER_EMAIL, APP_PASSWORD)
-            smtp.send_message(msg)
-        LOG.info(f"  ✅ Email → {', '.join(RECEIVER_EMAILS)}")
-    except Exception as e:
-        LOG.error(f"  ❌ Email fail: {e}")
+            smtp.sendmail(SENDER_EMAIL, RECEIVER_EMAILS, msg_outer.as_string())
+            smtp.quit()
+            LOG.info(f"  ✅ Email sent via {method} → {', '.join(RECEIVER_EMAILS)}")
+            sent = True
+            break
+
+        except smtplib.SMTPAuthenticationError as e:
+            LOG.error(f"  ❌ Auth failed ({method}): {e}")
+            LOG.error("     → Check App Password in .env (must be Gmail App Password, not account password)")
+            break  # No point trying other port if credentials are wrong
+
+        except smtplib.SMTPException as e:
+            LOG.warning(f"  ⚠️  {method} SMTP error: {e} — trying next method")
+
+        except Exception as e:
+            LOG.warning(f"  ⚠️  {method} failed: {e} — trying next method")
+
+    if not sent:
+        LOG.error("  ❌ Email failed on all methods. Check firewall / App Password / 2FA status.")
+
 
 # =============================================================================
 #  TARGET RUNNER
 # =============================================================================
 def run_target(target: Dict, session: requests.Session, history: Dict) -> Tuple[Dict, requests.Session]:
-    org = target.get("organization", "") or "All"
-    label = f"{target['ministry']} / {org}"
+    org     = target.get("organization", "") or "All"
+    label   = f"{target['ministry']} / {org}"
     org_key = safe_filename(f"{target['ministry']}__{org}")
 
     LOG.info(f"\n{'='*65}")
@@ -684,7 +982,7 @@ def run_target(target: Dict, session: requests.Session, history: Dict) -> Tuple[
     result = {
         "label": label, "status": "pending",
         "total": 0, "new": 0, "changed": 0, "existing": 0,
-        "rows": [], "date_changes": [],
+        "rows": [], "date_changes": [], "duplicates": [],
     }
 
     try:
@@ -695,41 +993,51 @@ def run_target(target: Dict, session: requests.Session, history: Dict) -> Tuple[
             result["status"] = "no_bids"
             return result, session
 
+        # parse_docs already filters out RA bids internally
         bids = parse_docs(raw_docs, target["ministry"], target.get("organization", ""))
 
-        # ================= DUPLICATE REMOVAL (TARGET LEVEL) =================
-        unique_map = {}
+        # ── Duplicate removal ─────────────────────────────────────────────
+        unique_map     = {}
+        duplicate_list = []
         for bid in bids:
             bn = bid.get("Bid Number", "").strip()
             if bn:
-                unique_map[bn] = bid
+                if bn in unique_map:
+                    duplicate_list.append(bid)
+                else:
+                    unique_map[bn] = bid
         bids = list(unique_map.values())
-        LOG.info(f"  After duplicate removal: {len(bids)}")
-        # =====================================================================
+        LOG.info(f"  After dedup: {len(bids)} unique | {len(duplicate_list)} duplicates")
+        # ─────────────────────────────────────────────────────────────────
 
         new_l, chg_l, ex_l = classify_bids(bids, org_key, history)
         LOG.info(f"  NEW={len(new_l)} CHG={len(chg_l)} EX={len(ex_l)}")
 
         date_changes = [
-            {"bid_number": b.get("Bid Number", ""), "description": b.get("Category", ""),
-             "old_date": b.get("_old_end_date", ""), "new_date": b.get("End Date", "")}
+            {
+                "bid_number":  b.get("Bid Number", ""),
+                "description": b.get("Category", ""),
+                "old_date":    b.get("_old_end_date", ""),
+                "new_date":    b.get("End Date", ""),
+            }
             for _, b in chg_l
         ]
 
         update_history(bids, org_key, history)
 
         result.update({
-            "status": "completed",
-            "total": len(bids),
-            "new": len(new_l),
-            "changed": len(chg_l),
-            "existing": len(ex_l),
-            "rows": new_l + chg_l + ex_l,
+            "status":       "completed",
+            "total":        len(bids),
+            "new":          len(new_l),
+            "changed":      len(chg_l),
+            "existing":     len(ex_l),
+            "rows":         new_l + chg_l + ex_l,
             "date_changes": date_changes,
+            "duplicates":   duplicate_list,
         })
 
     except Exception as e:
-        LOG.error(f"  Error: {e}")
+        LOG.error(f"  Error: {e}\n{traceback.format_exc()}")
         result["status"] = "error"
 
     time.sleep(DELAY_ORG)
@@ -748,13 +1056,13 @@ def main():
         pass
 
     start = time.time()
-    LOG.info("="*65)
+    LOG.info("=" * 65)
     LOG.info(f"GeM Bot — {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
-    LOG.info(f"Targets: {len(TARGETS)}")
-    LOG.info("="*65)
+    LOG.info(f"Targets: {len(TARGETS)}  |  RA bids will be excluded automatically")
+    LOG.info("=" * 65)
 
     os.makedirs(EXCEL_FOLDER, exist_ok=True)
-    os.makedirs(LOG_FOLDER, exist_ok=True)
+    os.makedirs(LOG_FOLDER,   exist_ok=True)
 
     history = load_history()
     session = create_session()
@@ -763,7 +1071,7 @@ def main():
     targets = [TARGETS[i] for i in indices if i < len(TARGETS)] if indices else TARGETS
     LOG.info(f"Running: {len(targets)} targets")
 
-    results, all_rows, all_changes = [], [], []
+    results, all_rows, all_changes, all_duplicates = [], [], [], []
 
     for i, target in enumerate(targets, 1):
         org = target.get("organization", "") or "All"
@@ -773,34 +1081,40 @@ def main():
         results.append(r)
         all_rows.extend(r.get("rows", []))
         all_changes.extend(r.get("date_changes", []))
+        all_duplicates.extend(r.get("duplicates", []))
 
-        LOG.info(f"<<< {r['status'].upper()} T={r['total']} N={r['new']} C={r['changed']}")
+        LOG.info(f"<<< {r['status'].upper()} T={r['total']} N={r['new']} C={r['changed']} D={len(r.get('duplicates', []))}")
 
     save_history(history)
 
     if all_rows:
         master = os.path.join(EXCEL_FOLDER, f"gem_bids_{datetime.now().strftime('%Y%m%d_%H%M')}.xlsx")
-        LOG.info(f"\nBuilding: {master}")
-        excel = build_master_excel(all_rows, master)
-        LOG.info("Emailing...")
-        send_summary_email(results, all_rows, all_changes, excel)
+        LOG.info(f"\nBuilding Excel: {master}")
+        excel = build_master_excel(all_rows, all_duplicates, master)
+        LOG.info("Sending email...")
+        send_summary_email(results, all_rows, all_changes, all_duplicates, excel)
     else:
-        LOG.warning("⚠️  No bids")
+        LOG.warning("⚠️  No bids found across all targets")
 
     LOG.info(f"\n{'='*65}")
-    LOG.info("SUMMARY")
+    LOG.info("FINAL SUMMARY")
     LOG.info(f"{'='*65}")
-    LOG.info(f"{'Target':<50} {'Status':<12} {'T':>6} {'N':>5} {'C':>5}")
-    LOG.info("-"*65)
+    LOG.info(f"{'Target':<50} {'Status':<12} {'T':>6} {'N':>5} {'C':>5} {'D':>5}")
+    LOG.info("-" * 65)
     for r in results:
-        LOG.info(f"{r['label'][:49]:<50} {r['status']:<12} {r['total']:>6} {r['new']:>5} {r['changed']:>5}")
+        LOG.info(
+            f"{r['label'][:49]:<50} {r['status']:<12} "
+            f"{r['total']:>6} {r['new']:>5} {r['changed']:>5} {len(r.get('duplicates', [])):>5}"
+        )
 
-    total_bids = sum(r["total"] for r in results)
-    total_new = sum(r["new"] for r in results)
-    total_changed = sum(r["changed"] for r in results)
-    LOG.info("-"*65)
-    LOG.info(f"{'TOTALS':<50} {'':<12} {total_bids:>6} {total_new:>5} {total_changed:>5}")
-    LOG.info(f"\n⏱️  Done in {time.time()-start:.1f}s")
+    total_bids    = sum(r["total"]                       for r in results)
+    total_new     = sum(r["new"]                         for r in results)
+    total_changed = sum(r["changed"]                     for r in results)
+    total_dupes   = sum(len(r.get("duplicates", []))     for r in results)
+    LOG.info("-" * 65)
+    LOG.info(f"{'TOTALS':<50} {'':<12} {total_bids:>6} {total_new:>5} {total_changed:>5} {total_dupes:>5}")
+    LOG.info(f"\n⏱️  Done in {time.time() - start:.1f}s")
+
 
 if __name__ == "__main__":
     main()
